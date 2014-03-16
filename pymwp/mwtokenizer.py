@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 import sys
 try:
     from htmlentitydefs import name2codepoint
@@ -17,7 +17,7 @@ class Token(object):
     def __repr__(self):
         return ('<%s %r>' %
                 (self.__class__.__name__, self.name))
-    
+
     def add_char(self, c):
         self.name += c
         return
@@ -26,6 +26,7 @@ class Token(object):
 ##  WikiToken
 ##
 class WikiToken(Token): pass
+class ExtensionToken(Token): pass
 class WikiBOLToken(WikiToken): pass
 class WikiVarToken(WikiToken):
 
@@ -68,17 +69,34 @@ WikiToken.PRE = WikiToken(u'PRE')
 ##
 class XMLTagToken(Token):
 
-    NO_WIKI = ('nowiki', 'source',)
-    NO_TEXT = ('ref', 'gallery',)
-    BR_TAG = ('br',)
-    PAR_TAG = (
-        'p','li','td','th','dt','dd',
-        'h1','h2','h3','h4','h5','h6',
-        'div','pre','blockquote','address','center',
-        )
-    TABLE_TAG = ('table',)
-    TABLE_ROW_TAG = ('tr',)
+    def TAGS(x): return frozenset(x.split(u' '))
+
+    # Used by tokenizer.
+    # cf. https://meta.wikimedia.org/wiki/Help:HTML_in_wikitext
+    VALID_TAG = TAGS(
+        u'nowiki source ref gallery math '
+        u'abbr address b bdi big '
+        u'blockquote caption center cite '
+        u'code dd del dfn div dl dt em '
+        u'font h1 h2 h3 h4 h5 h6 '
+        u'i ins kbd li ol p pre '
+        u'rb rp rt ruby s samp small '
+        u'span strike strong sub sup table '
+        u'td th tr tt u ul var')
+
+    # Used by parser.
+    PAR_TAG = TAGS(
+        u'p li dd dt h1 h2 h3 h4 h5 h6 '
+        u'div pre blockquote address center '
+        u'td th')
+    TABLE_TAG = TAGS(u'table')
+    TABLE_ROW_TAG = TAGS(u'tr')
     
+    # Used by wiki2txt.
+    NO_WIKI = TAGS(u'nowiki source')
+    NO_TEXT = TAGS(u'ref gallery')
+    BR_TAG = TAGS(u'br')
+
     def __init__(self, name='', pos=0, attr=None):
         Token.__init__(self, name)
         self.pos = pos
@@ -136,7 +154,6 @@ class XMLStartTagToken(XMLTagToken):
 class XMLEndTagToken(XMLTagToken): pass
 class XMLEmptyTagToken(XMLTagToken): pass
 
-
     
 ##  WikiTextTokenizer
 ##
@@ -161,9 +178,8 @@ class WikiTextTokenizer(object):
             self.handler(self.pos, c)
             return
 
-    def __init__(self, codec='utf-8'):
-        self._codec = codec
-        self._scan = self._scan_bol
+    def __init__(self):
+        self._scan = self._scan_bod
         self._wiki = True
         self._token = None
         self._entity = None
@@ -179,10 +195,10 @@ class WikiTextTokenizer(object):
             self._textpos = self._text = None
         return
 
-    def feed_file(self, fp):
+    def feed_file(self, fp, codec='utf-8'):
         self._lineno = 0
         for line in fp:
-            line = line.decode(self._codec)
+            line = line.decode(codec, 'ignore')
             self.feed_text(line)
             self._lineno += 1
         return
@@ -222,6 +238,25 @@ class WikiTextTokenizer(object):
             self._text += c
         return
 
+    def _scan_bod(self, i, c):
+        if c == u'#':
+            self._token = ExtensionToken(name=c)
+            self._scan = self._scan_extension
+            return i+1
+        else:
+            self._scan = self._scan_bol
+            return i
+
+    def _scan_extension(self, i, c):
+        if c.isspace():
+            self._handle_token(i, self._token)
+            self._token = None
+            self._scan = self._scan_main
+            return i+1
+        else:
+            self._token.add_char(c)
+            return i+1
+
     def _scan_bol(self, i, c):
         self._line_token = None
         if c == u'\n':
@@ -240,10 +275,14 @@ class WikiTextTokenizer(object):
             self._scan = self._scan_main
             return i+1
         elif c == u'=':
-            self._token = WikiHeadlineToken(pos=i)
+            self._token = WikiHeadlineToken(name=c, pos=i)
             self._line_token = self._token
             self._scan = self._scan_bol_headline
-            return i
+            return i+1
+        elif c in u'*#:;':
+            self._token = WikiItemizeToken(name=c, pos=i)
+            self._scan = self._scan_bol_itemize
+            return i+1
         elif c.isspace():
             self._scan = self._scan_bol_sp
             return i+1
@@ -254,10 +293,6 @@ class WikiTextTokenizer(object):
     def _scan_bol2(self, i, c):
         if c == u'{':
             self._scan = self._scan_bol_brace
-            return i+1
-        elif c in u'*#:;':
-            token = WikiItemizeToken(name=c, pos=i)
-            self._handle_token(token.pos, token)
             return i+1
         else:
             self._scan = self._scan_main
@@ -315,6 +350,17 @@ class WikiTextTokenizer(object):
             self._handle_token(self._token.pos, self._token)
             self._token = None
             self._scan = self._scan_main
+            return i
+
+    def _scan_bol_itemize(self, i, c):
+        assert isinstance(self._token, WikiItemizeToken), self._token
+        if c in u'*#:;':
+            self._token.add_char(c)
+            return i+1
+        else:
+            self._handle_token(self._token.pos, self._token)
+            self._token = None
+            self._scan = self._scan_bol2
             return i
 
     def _scan_bol_brace(self, i, c):
@@ -461,7 +507,7 @@ class WikiTextTokenizer(object):
                 n = name2codepoint[self._entity.name]
                 self._entity.handle_char(unichr(n))
             except KeyError:
-                pass
+                self._entity.handle_char(u'&'+self._entity.name)
             self._scan = self._entity.state
             self._entity = None
             if c == u';':
@@ -495,6 +541,10 @@ class WikiTextTokenizer(object):
     def _scan_starttag_mid(self, i, c):
         assert isinstance(self._token, XMLStartTagToken), self._token
         if c == u'>':
+            # Treat as an empty tag if it's one.
+            if self._token.name not in XMLTagToken.VALID_TAG:
+                self._token = XMLEmptyTagToken(
+                    self._token.name, self._token.pos, self._token.attrs)
             self._handle_token(self._token.pos, self._token)
             self._token = None
             self._scan = self._scan_main
@@ -735,7 +785,7 @@ class WikiTextTokenizer(object):
 
 # main
 def main(argv):
-    args = argv[1:] or ['-']
+    from utils import getfp
     class Tokenizer(WikiTextTokenizer):
         def handle_text(self, pos, text):
             print (pos, text)
@@ -743,25 +793,15 @@ def main(argv):
         def handle_token(self, pos, token):
             print (pos, token)
             return
+    args = argv[1:] or ['-']
     codec = 'utf-8'
     for path in args:
         print >>sys.stderr, path
-        if path == '-':
-            fp = sys.stdin
-        elif path.endswith('.gz'):
-            from gzip import GzipFile
-            fp = GzipFile(path)
-        elif path.endswith('.bz2'):
-            from bz2 import BZ2File
-            fp = BZ2File(path)
-        else:
-            fp = open(path)
+        (_,fp) = getfp(path)
         tokenizer = Tokenizer()
-        for line in fp:
-            line = unicode(line, codec)
-            tokenizer.feed_text(line)
-        fp.close()
+        tokenizer.feed_file(fp, codec=codec)
         tokenizer.close()
+        fp.close()
     return
 
 if __name__ == '__main__': sys.exit(main(sys.argv))

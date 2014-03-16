@@ -1,25 +1,35 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 #
-# usage:
-#  $ mwwiki2txt.py -n10 -t 'article%(pageid)05d.txt' jawiki.xml.bz2
+# Usage examples:
+#  $ mwwiki2txt.py article12.wiki > article12.txt
+#  $ mwwiki2txt.py -L article12.wiki > article12.link
+#  $ mwwiki2txt.py -Z -o jawiki.txt.cdb jawiki.xml.bz2
+#  $ mwwiki2txt.py -Z -o jawiki.txt.cdb jawiki.wiki.cdb
+#  $ mwwiki2txt.py -o all.txt.bz2 jawiki.xml.bz2
+#  $ mwwiki2txt.py -P 'article%(pageid)08d.txt' jawiki.xml.bz2
 #
 import re
 import sys
-from gzip import GzipFile
-from bz2 import BZ2File
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from StringIO import StringIO
-from pymwp.mwtokenizer import WikiToken, XMLTagToken, XMLEmptyTagToken
+from pymwp.mwtokenizer import WikiToken
+from pymwp.mwtokenizer import XMLTagToken
+from pymwp.mwtokenizer import XMLEmptyTagToken
 from pymwp.mwparser import WikiTextParser
-from pymwp.mwparser import WikiTree, WikiXMLTree, WikiArgTree
-from pymwp.mwparser import WikiSpecialTree, WikiCommentTree
-from pymwp.mwparser import WikiKeywordTree, WikiLinkTree
+from pymwp.mwparser import WikiTree
+from pymwp.mwparser import WikiXMLTree
+from pymwp.mwparser import WikiArgTree
+from pymwp.mwparser import WikiSpecialTree
+from pymwp.mwparser import WikiCommentTree
+from pymwp.mwparser import WikiKeywordTree
+from pymwp.mwparser import WikiLinkTree
 from pymwp.mwparser import WikiDivTree
-from pymwp.mwparser import WikiTableTree, WikiTableCellTree
+from pymwp.mwparser import WikiTableTree
+from pymwp.mwparser import WikiTableCellTree
+from pymwp.mwparser import WikiParserError
 from pymwp.mwxmldump import MWXMLDumpFilter
-from pymwp.pycdb import CDBReader, CDBMaker
+from pymwp.mwcdb import WikiDBReader
+from pymwp.mwcdb import WikiDBWriter
+from pymwp.mwcdb import WikiFileWriter
+from pymwp.utils import getfp
 
 
 SPC = re.compile(r'\s+')
@@ -33,31 +43,34 @@ def isignored(name): return IGNORED.match(name)
 ##
 class WikiTextExtractor(WikiTextParser):
 
-    def __init__(self, errfp=sys.stderr, codec='utf-8'):
+    def __init__(self, errfp=None):
         WikiTextParser.__init__(self)
         self.errfp = errfp
-        self.codec = codec
         return
 
     def error(self, s):
-        self.errfp.write(s)
+        if self.errfp is not None:
+            self.errfp.write(s+'\n')
         return
 
     def invalid_token(self, pos, token):
-        if self.errfp is not None:
-            self.error('invalid token(%d): %r\n' % (pos, token))
+        self.error('invalid token(%d): %r' % (pos, token))
         return
 
-    def convert(self, fp, tree=None):
-        if tree is None:
-            self.convert(fp, self.get_root())
-        elif tree is WikiToken.PAR:
-            fp.write('\n')
+    def close(self):
+        WikiTextParser.close(self)
+        return self.convert(self.get_root())
+
+    def convert(self, tree):
+        if tree is WikiToken.PAR:
+            yield u'\n'
         elif isinstance(tree, XMLEmptyTagToken):
             if tree.name in XMLTagToken.BR_TAG:
-                fp.write('\n')
+                yield u'\n'
         elif isinstance(tree, unicode):
-            fp.write(rmsp(tree).encode(self.codec, 'ignore'))
+            yield rmsp(tree)
+        elif isinstance(tree, WikiToken):
+            yield rmsp(tree.name)
         elif isinstance(tree, WikiSpecialTree):
             pass
         elif isinstance(tree, WikiCommentTree):
@@ -67,9 +80,10 @@ class WikiTextExtractor(WikiTextParser):
                 pass
             else:
                 for c in tree:
-                    self.convert(fp, c)
+                    for x in self.convert(c):
+                        yield x
                 if tree.xml.name in XMLTagToken.PAR_TAG:
-                    fp.write('\n')
+                    yield u'\n'
         elif isinstance(tree, WikiKeywordTree):
             if tree:
                 if isinstance(tree[0], WikiTree):
@@ -77,29 +91,36 @@ class WikiTextExtractor(WikiTextParser):
                 else:
                     name = tree[0]
                 if isinstance(name, unicode) and not isignored(name):
-                    self.convert(fp, tree[-1])
+                    for x in self.convert(tree[-1]):
+                        yield x
         elif isinstance(tree, WikiLinkTree):
             if 2 <= len(tree):
                 for c in tree[1:]:
-                    self.convert(fp, c)
-                    fp.write(' ')
+                    for x in self.convert(c):
+                        yield x
+                    yield u' '
             elif tree:
-                self.convert(fp, tree[0])
+                for x in self.convert(tree[0]):
+                    yield x
         elif isinstance(tree, WikiTableCellTree):
             if tree:
-                self.convert(fp, tree[-1])
-                fp.write('\n')
+                for x in self.convert(tree[-1]):
+                    yield x
+                yield u'\n'
         elif isinstance(tree, WikiTableTree):
             for c in tree:
                 if not isinstance(c, WikiArgTree):
-                    self.convert(fp, c)
+                    for x in self.convert(c):
+                        yield x
         elif isinstance(tree, WikiDivTree):
             for c in tree:
-                self.convert(fp, c)
-            fp.write('\n')
+                for x in self.convert(c):
+                    yield x
+            yield u'\n'
         elif isinstance(tree, WikiTree):
             for c in tree:
-                self.convert(fp, c)
+                for x in self.convert(c):
+                    yield x
         return
 
 
@@ -107,36 +128,37 @@ class WikiTextExtractor(WikiTextParser):
 ##
 class WikiLinkExtractor(WikiTextParser):
 
-    def __init__(self, errfp=sys.stderr, codec='utf-8'):
+    def __init__(self, errfp=None):
         WikiTextParser.__init__(self)
         self.errfp = errfp
-        self.codec = codec
         return
 
     def error(self, s):
-        self.errfp.write(s)
+        if self.errfp is not None:
+            self.errfp.write(s+'\n')
         return
 
     def invalid_token(self, pos, token):
-        if self.errfp is not None:
-            self.error('invalid token(%d): %r\n' % (pos, token))
+        self.error('invalid token(%d): %r' % (pos, token))
         return
 
-    def convert(self, fp, tree=None):
-        if tree is None:
-            self.convert(fp, self.get_root())
-        elif isinstance(tree, WikiKeywordTree):
+    def close(self):
+        WikiTextParser.close(self)
+        return self.convert(self.get_root())
+
+    def convert(self, tree):
+        if isinstance(tree, WikiKeywordTree):
             if tree:
                 if isinstance(tree[0], WikiTree):
                     name = tree[0].get_text()
                 else:
                     name = tree[0]
                 if isinstance(name, unicode):
-                    fp.write('keyword\t'+name.encode(self.codec, 'ignore'))
+                    out = (u'keyword', name)
                     if 2 <= len(tree) and not isignored(name):
                         text = tree[-1].get_text()
-                        fp.write('\t'+text.encode(self.codec, 'ignore'))
-                    fp.write('\n')
+                        out += (text,)
+                    yield u'\t'.join(out)+u'\n'
         elif isinstance(tree, WikiLinkTree):
             if tree:
                 if isinstance(tree[0], WikiTree):
@@ -144,14 +166,15 @@ class WikiLinkExtractor(WikiTextParser):
                 else:
                     url = tree[0]
                 if isinstance(url, unicode):
-                    fp.write('link\t'+url.encode(self.codec, 'ignore'))
+                    out = (u'link', url)
                     if 2 <= len(tree):
                         text = tree[-1].get_text()
-                        fp.write('\t'+text.encode(self.codec, 'ignore'))
-                    fp.write('\n')
+                        out += (text,)
+                    yield u'\t'.join(out)+u'\n'
         elif isinstance(tree, WikiTree):
             for c in tree:
-                self.convert(fp, c)
+                for x in self.convert(c):
+                    yield x
         return
 
 
@@ -159,151 +182,145 @@ class WikiLinkExtractor(WikiTextParser):
 ##
 class MWDump2Text(MWXMLDumpFilter):
 
-    def __init__(self, factory,
-                 outfp=sys.stdout, codec='utf-8', titleline=True,
-                 titlepat=None, revisionlimit=1):
-        MWXMLDumpFilter.__init__(
-            self,
-            titlepat=titlepat, revisionlimit=revisionlimit)
-        self.factory = factory
-        self.codec = codec
-        self.outfp = outfp
-        self.titleline = titleline
+    def __init__(self, converter):
+        MWXMLDumpFilter.__init__(self)
+        self.converter = converter
         return
 
-    def open_file(self, pageid, title, revision):
-        print >>sys.stderr, (title,revision)
-        if self.titleline:
-            self.write(title+'\n')
-        self._textparser = self.factory(self.codec)
-        return self.outfp
-    
-    def write_file(self, fp, text):
-        self._textparser.feed_text(text)
+    def start_page(self, pageid, title):
+        MWXMLDumpFilter.start_page(self, pageid, title)
+        pageid = int(pageid)
+        self.converter.add_page(pageid, title)
         return
+
+    def open_file(self, pageid, title, revid, timestamp):
+        pageid = int(pageid)
+        revid = int(pageid)
+        self.converter.add_revid(pageid, revid)
+        return self._Stream(pageid, revid)
     
     def close_file(self, fp):
-        self._textparser.close()
-        self._textparser.convert(fp)
-        self.write('\f\n')
+        self.converter.feed_text(fp.pageid, fp.revid, u''.join(fp.text))
+        return
+    
+    def write_file(self, fp, text):
+        fp.text.append(text)
         return
 
+    class _Stream(object):
+        def __init__(self, pageid, revid):
+            self.pageid = pageid
+            self.revid = revid
+            self.text = []
+            return
 
-##  MWCDB2Text
+
+##  Converter
 ##
-class MWCDB2Text(object):
-
-    def __init__(self, srcpath, dstpath, factory):
-        self.reader = CDBReader(srcpath)
-        self.writer = CDBMaker(dstpath)
-        self.factory = factory
+class Converter(object):
+    
+    def __init__(self, writer, klass, errfp=None):
+        self.writer = writer
+        self.klass = klass
+        self.errfp = errfp
         return
 
     def close(self):
-        self.writer.finish()
         return
 
-    def convert(self, pageid, revision=0):
-        key = '%d/%d:text' % (pageid, revision)
-        srcbuf = StringIO(self.reader[key])
-        src = GzipFile(mode='r', fileobj=srcbuf)
-        dstbuf = StringIO()
-        dst = GzipFile(mode='w', fileobj=dstbuf)
-        textparser = self.factory('utf-8')
-        textparser.feed_text(src.read().decode('utf-8'))
-        textparser.close()
-        textparser.convert(dst)
-        src.close()
-        dst.close()
-        self.writer.add(key, dstbuf.getvalue())
-        key = '%d:title' % pageid
-        self.writer.add(key, self.reader[key])
+    def error(self, s):
+        if self.errfp is not None:
+            self.errfp.write(s+'\n')
         return
-
-    def convert_all(self):
-        for key in self.reader:
-            (id,_,type) = key.partition(':')
-            if type != 'text': continue
-            try:
-                (pageid,_,revision) = id.partition('/')
-                pageid = int(pageid)
-                revision = int(revision)
-            except ValueError:
-                continue
-            print >>sys.stderr, (pageid,revision)
-            self.convert(pageid, revision)
+        
+    def add_page(self, pageid, title):
+        print >>sys.stderr, (pageid, title)
+        self.writer.add_page(pageid, title)
         return
-
+        
+    def add_revid(self, pageid, revid):
+        self.writer.add_revid(pageid, revid)
+        return
+        
+    def feed_text(self, pageid, revid, text):
+        parser = self.klass(errfp=self.errfp)
+        try:
+            parser.feed_text(text)
+            text = u''.join(parser.close())
+            self.writer.add_text(pageid, revid, text)
+        except WikiParserError, e:
+            self.error('error: %r' % e)
+        return
+        
+    def feed_file(self, pageid, revid, fp, codec='utf-8'):
+        parser = self.klass(errfp=self.errfp)
+        try:
+            parser.feed_file(fp, codec=codec)
+            text = u''.join(parser.close())
+            self.writer.add_text(pageid, revid, text)
+        except WikiParserError, e:
+            self.error('error: %r' % e)
+        return
 
 # main
 def main(argv):
     import getopt
-    def getfp(path, mode='r'):
-        if path == '-' and mode == 'r':
-            return sys.stdin
-        elif path == '-' and mode == 'w':
-            return sys.stdout
-        elif path.endswith('.gz'):
-            return GzipFile(path, mode=mode)
-        elif path.endswith('.bz2'):
-            return BZ2File(path, mode=mode)
-        else:
-            return open(path, mode=mode+'b')
     def usage():
-        print ('usage: %s [-X xmldump] [-C cdbdump] [-o output] [-c codec] [-T] [-L] '
-               '[-e titlepat] [-r revisionlimit] [file ...]') % argv[0]
+        print ('usage: %s [-L] [-d] [-o output] [-P pathpat] [-c codec] [-T] [-Z] '
+               '[file ...]') % argv[0]
         return 100
     try:
-        (opts, args) = getopt.getopt(argv[1:], 'X:C:o:c:TLe:r:')
+        (opts, args) = getopt.getopt(argv[1:], 'Ldo:P:c:TZ')
     except getopt.GetoptError:
         return usage()
-    xmldump = None
-    cdbdump = None
-    output = None
+    args = args or ['-']
+    errfp = None
+    output = '-'
     codec = 'utf-8'
-    titlepat = None
-    revisionlimit = 1
+    ext = ''
+    pathpat = None
     titleline = False
-    factory = (lambda codec: WikiTextExtractor(codec=codec))
+    klass = WikiTextExtractor
     for (k, v) in opts:
-        if k == '-X': xmldump = v
-        elif k == '-C': cdbdump = v
+        if k == '-d': errfp = sys.stderr
         elif k == '-o': output = v
+        elif k == '-P': pathpat = v
         elif k == '-c': codec = v 
         elif k == '-T': titleline = True
-        elif k == '-L': factory = (lambda codec: WikiLinkExtractor(codec=codec))
-        elif k == '-e': titlepat = re.compile(v)
-        elif k == '-r': revisionlimit = int(v)
-    if xmldump is not None:
-        outfp = getfp(output or '-', 'w')
-        parser = MWDump2Text(
-            factory, outfp=outfp,
-            codec=codec, titleline=titleline,
-            titlepat=titlepat, revisionlimit=revisionlimit)
-        fp = getfp(xmldump)
-        parser.feed_file(fp)
-        fp.close()
-        parser.close()
-    elif cdbdump is not None:
-        if not output: return usage()
-        reader = MWCDB2Text(cdbdump, output, factory)
-        if args:
-            for pageid in args:
-                reader.convert(int(pageid))
-        else:
-            try:
-                reader.convert_all()
-            finally:
-                reader.close()
+        elif k == '-Z': ext = '.gz'
+        elif k == '-L': klass = WikiLinkExtractor
+    if output.endswith('.cdb'):
+        writer = WikiDBWriter(output, codec=codec, ext=ext)
     else:
-        outfp = getfp(output or '-', 'w')
-        for path in (args or ['-']):
-            parser = factory(codec)
-            fp = getfp(path)
-            parser.feed_file(fp)
-            fp.close()
-            parser.close()
-            parser.convert(outfp)
+        writer = WikiFileWriter(
+            output=output, pathpat=pathpat,
+            codec=codec, titleline=titleline)
+    try:
+        converter = Converter(writer, klass, errfp=errfp)
+        for path in args:
+            if path.endswith('.cdb'):
+                reader = WikiDBReader(path, codec=codec, ext=ext)
+                for pageid in reader:
+                    (title, revids) = reader[pageid]
+                    converter.add_page(pageid, title)
+                    for revid in revids:
+                        wiki = reader.get_wiki(pageid, revid)
+                        converter.add_revid(pageid, revid)
+                        converter.feed_text(pageid, revid, wiki)
+            else:
+                (path,fp) = getfp(path)
+                if path.endswith('.xml'):
+                    parser = MWDump2Text(converter)
+                    parser.feed_file(fp)
+                    parser.close()
+                else:
+                    converter.add_page(0, path)
+                    converter.add_revid(0, 0)
+                    converter.feed_file(0, 0, fp, codec=codec)
+                fp.close()
+        converter.close()
+    finally:
+        writer.close()
     return
 
 if __name__ == '__main__': sys.exit(main(sys.argv))

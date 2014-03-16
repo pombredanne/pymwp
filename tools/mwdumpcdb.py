@@ -1,90 +1,63 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
+#
+# Usage examples:
+#  $ mwdumpcdb.py -Z jawiki.txt.cdb 19 23 346 9287
+#  $ mwdumpcdb.py -Z -w jawiki.wiki.cdb
+#  $ mwdumpcdb.py -Z -o all.txt.gz jawiki.txt.cdb
+#
 import sys
-from gzip import GzipFile
-from bz2 import BZ2File
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from StringIO import StringIO
-from pymwp.pycdb import CDBReader
-
-
-##  MWCDB2Dumper
-##
-class MWCDB2Dumper(object):
-
-    def __init__(self, path):
-        self.reader = CDBReader(path)
-        return
-
-    def __iter__(self):
-        for key in self.reader:
-            (id,_,type) = key.partition(':')
-            if type != 'text': continue
-            try:
-                (pageid,_,revision) = id.partition('/')
-                pageid = int(pageid)
-                revision = int(revision)
-            except ValueError:
-                continue
-            yield self.get(pageid, revision)
-        return
-
-    def get(self, pageid, revision=0):
-        try:
-            title = self.reader['%d:title' % pageid].decode('utf-8')
-        except KeyError:
-            title = None
-        key = '%d/%d:text' % (pageid, revision)
-        buf = StringIO(self.reader[key])
-        fp = GzipFile(mode='r', fileobj=buf)
-        text = fp.read().decode('utf-8')
-        return (title, text)
-
+import os.path
+from pymwp.utils import getfp
+from pymwp.mwcdb import WikiDBReader
 
 # main
 def main(argv):
     import getopt
-    def getfp(path, mode='r'):
-        if path == '-' and mode == 'r':
-            return sys.stdin
-        elif path == '-' and mode == 'w':
-            return sys.stdout
-        elif path.endswith('.gz'):
-            return GzipFile(path, mode=mode)
-        elif path.endswith('.bz2'):
-            return BZ2File(path, mode=mode)
-        else:
-            return open(path, mode=mode+'b')
     def usage():
-        print ('usage: %s [-c codec] [-o output] [-T] [cdbfile] [key ...]') % argv[0]
+        print ('usage: %s {-w} [-c codec] [-o output] [-T] [-Z] '
+               'cdbfile [pageid ...]' % argv[0])
         return 100
     try:
-        (opts, args) = getopt.getopt(argv[1:], 'o:c:T')
+        (opts, args) = getopt.getopt(argv[1:], 'wo:c:TZ')
     except getopt.GetoptError:
         return usage()
-    output = None
+    text = True
+    output = '-'
     codec = 'utf-8'
+    ext = ''
     titleline = False
     for (k, v) in opts:
         if k == '-o': output = v
         elif k == '-c': codec = v
+        elif k == '-w': text = False
         elif k == '-T': titleline = True
+        elif k == '-Z': ext = '.gz'
     if not args: return usage()
-    outfp = getfp(output or '-', 'w')
-    reader = MWCDB2Dumper(args.pop(0))
-    def dump(fp, title, text):
-        if titleline:
-            fp.write(title.encode(codec, 'ignore')+'\n')
-        fp.write(text.encode(codec, 'ignore'))
-        return
-    if args:
-        for pageid in args:
-            (title, text) = reader.get(int(pageid))
-            dump(outfp, title, text)
-    else:
-        for (title,text) in reader:
-            dump(outfp, title, text)
+    (_,outfp) = getfp(output, 'w')
+    readers = []
+    pageids = []
+    for arg in args:
+        if os.path.isfile(arg):
+            readers.append(WikiDBReader(arg, codec=codec, ext=ext))
+        else:
+            pageids.append(arg)
+    for reader in readers:
+        for pageid in (pageids or iter(reader)):
+            try:
+                (title, revids) = reader[pageid]
+            except KeyError:
+                continue
+            if titleline:
+                outfp.write(title.encode(codec, 'ignore')+'\n')
+            for revid in revids:
+                try:
+                    if text:
+                        data = reader.get_text(pageid, revid)
+                    else:
+                        data = reader.get_wiki(pageid, revid)
+                except KeyError:
+                    continue
+                outfp.write(data.encode(codec, 'ignore'))
     return
 
 if __name__ == '__main__': sys.exit(main(sys.argv))
